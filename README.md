@@ -6,5 +6,6 @@ Install this by creating a custom device driver. Under device driver set the sys
 
  *** DO NOT "logEnable" MORE THAN ONE "Syslog" DEVICE AT A TIME, OR YOU
      WILL GET A RECIPROCAL LOOP BETWEEN THEM. ***
+(most people will likely use only one remote syslog device anyway ...)
 
 See also https://github.com/rmonk/hubitatSyslogDriver
