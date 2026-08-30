@@ -3,7 +3,7 @@
 Originally forked from https://github.com/staylorx/hubitatCode/, which
 itself was a fork from https://github.com/rmonk/hubitatSyslogDriver,
 this is an updated remote syslog device driver for Hubitat home
-automation hubs.
+automation hubs. 
 
 The latest version of this driver contains watchdog code to restart
 its connection to the Hubitat device's log interface if it finds the
