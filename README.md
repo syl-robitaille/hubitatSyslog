@@ -1,11 +1,20 @@
-# hubitatCode
+# hubitatSyslog
 
-NOTICE: The TCP side of this is still a work-in-progress, specifically working to get rid of the hub log warning "Read timed out", which is ellusive to fix. Please PR this if you have the fix!
+Originally forked from https://github.com/staylorx/hubitatCode/, which
+itself was a fork from https://github.com/rmonk/hubitatSyslogDriver,
+this is an updated remote syslog device driver for Hubitat home
+automation hubs.
 
-Install this by creating a custom device driver. Under device driver set the syslog IP addres, port, UDP/TCP, and optionally set a hostname for the hub.
+The latest version of this driver contains watchdog code to restart
+its connection to the Hubitat device's log interface if it finds the
+device has been quiet for longer than is typical.
 
- *** DO NOT "logEnable" MORE THAN ONE "Syslog" DEVICE AT A TIME, OR YOU
-     WILL GET A RECIPROCAL LOOP BETWEEN THEM. ***
-(most people will likely use only one remote syslog device anyway ...)
+Install this by creating a custom device driver. Configure the syslog
+server name or IP addres, port, UDP/TCP, and optionally set a hostname
+for the hub.
 
-See also https://github.com/rmonk/hubitatSyslogDriver;  NOTE that in my own environment, we're still occasionally seeing failures for the remote syslogs starting when the hubitat reboots, and are still working to resolve these.  In the meantime, a keen eye on the remote log system after hubitat reboots is necessary.  Re-initialize the remote syslog pseudo-device if it doesn't restart properly after reboot.
+## Tip
+
+A Rule Machine rule can be created to send a "mark" log message at a
+desired interval, shorter than the watchdog timeout.  This way you'll
+always know that the remote syslog device is working.
