@@ -93,6 +93,19 @@
   - With debug logging on, log the logsocket JSON keys once after
     each initialize(), to confirm the field names.
   - Bugfix: missing ")" closing the "port" preference input.
+  - TCP: send over one persistent raw socket (interfaces.rawSocket)
+    instead of one HubAction LAN_TYPE_RAW connection per line.  Those
+    waited for a reply that a syslog server never sends, so each one
+    ended in "Read timed out", and under load the hub piled up
+    "pending hub commands".  The new connection is opened at
+    initialize(), reopened with back-off (5 seconds, doubling up to 5
+    minutes) after a failed send, a socketStatus() report or a failed
+    connect, and checked by the watchdog.  Up to 500 lines are kept in
+    memory while it is down, and sent in order once it is back; if
+    more arrive, the oldest are discarded and counted.  "Disconnect"
+    closes it along with the websocket.  UDP is unchanged.
+  - parse() ignores input that is not a logsocket JSON entry, since
+    the raw socket also delivers to parse().
 */
 
 metadata {
@@ -167,6 +180,24 @@ import hubitat.device.Protocol
 // and not merely from ourselves.
 @Field static final java.util.concurrent.ConcurrentHashMap syslogSiblings = new java.util.concurrent.ConcurrentHashMap()
 
+// With TCP, each instance of this driver keeps one raw socket open to the
+// syslog server.  What we know about it lives here, keyed by device id (see
+// tcpLink()).  It is in memory only: it is lost on a reboot or a re-save of
+// the driver code, after which we simply connect again.
+@Field static final java.util.concurrent.ConcurrentHashMap tcpLinks = new java.util.concurrent.ConcurrentHashMap()
+
+// Lines kept while the TCP connection is down; beyond this, the oldest go.
+@Field static final Integer tcpBacklogMax = 500
+
+// TCP reconnection back-off: the first retry comes after tcpRetryMinSecs,
+// doubling on each failure up to tcpRetryMaxSecs.
+@Field static final Integer tcpRetryMinSecs = 5
+@Field static final Integer tcpRetryMaxSecs = 300
+
+// The hub may report on a raw socket shortly after we have closed it
+// ourselves; such reports are ignored for this long.
+@Field static final Long tcpCloseQuietMillis = 5000
+
 // For syslogging:
 @Field static final Map facilityMap =
     [
@@ -225,6 +256,7 @@ void uninstalled() {
     log.info "uninstalled()"
     unschedule()
     disconnect()
+    tcpLinks.remove(device.id.toString())
 }
 
 void updated() {
@@ -278,6 +310,20 @@ void initialize() {
     runIn(20,  "postBootCheck", [overwrite: false])
     runIn(60,  "postBootCheck", [overwrite: false])
     runIn(180, "postBootCheck", [overwrite: false])
+
+    // TCP: (re)open our connection to the syslog server, which also picks
+    // up any change of address or port.  UDP: we have no use for one.
+    // (As in parse(), anything but UDP means TCP.)
+    Map link = tcpLink()
+    if (udptcp != "UDP") {
+        link.retrySecs = tcpRetryMinSecs
+        scheduleTcpConnect(link, 2)
+    } else {
+        unschedule("tcpConnect")
+        link.retryPending = false
+        if (link.open) tcpClose(link)
+        link.backlog.clear()
+    }
 
     String watchdogEvery = (watchdogMinutes == null) ? "5" : watchdogMinutes.toString()
     Integer staleAfter   = (staleMinutes ?: 10)
@@ -337,8 +383,33 @@ void webSocketStatus(String message) {
     }
 }
 
+// The hub's news about our TCP connection to the syslog server.
+void socketStatus(String message) {
+    Map link = tcpLink()
+
+    // A report about a socket we have closed, or have just replaced with
+    // a new one, is not news.
+    if (!link.open || now() - (link.closedAt ?: 0L) < tcpCloseQuietMillis) {
+        if (logEnable) log.debug "socketStatus(): ${message} (ignored: TCP connection not in use)"
+        return
+    }
+
+    log.warn "socketStatus(): ${message}; will reconnect in ${link.retrySecs} seconds"
+    link.open = false
+    link.lastError = message ?: "(no message)"
+    scheduleTcpConnect(link)
+}
+
 void parse(String description) {
-    
+
+    // With TCP, the syslog server's socket delivers to parse() too.  A
+    // syslog server has nothing to say to us, and anything that is not
+    // a logsocket JSON entry did not come from the hub's log, so drop it.
+    if (!description?.trim()?.startsWith("{")) {
+        if (logEnable) log.debug "parse(): ignoring data that is not a log entry: ${description}"
+        return
+    }
+
     def descData = new JsonSlurper().parseText(description)
     String logLevel = descData.level != null ? descData.level : "info"
     String  sourceId = "${descData.id}"
@@ -445,8 +516,7 @@ void parse(String description) {
             if (udptcp == 'UDP') {
               sendHubCommand(new HubAction(constructedString, Protocol.LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_UDPCLIENT, ignoreResponse:true]))
             } else {
-              // RFC 6587 non-transparent framing: one newline ends the frame.
-              sendHubCommand(new HubAction(constructedString + "\n", Protocol.RAW_LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_RAW]))
+              sendTcp(constructedString)
             }
 
         } else {
@@ -488,6 +558,12 @@ void disconnect() {
     // for up to five minutes (or watchdog interval)".
     state.deliberateDisconnect = true
     interfaces.webSocket.close()
+
+    // With nothing coming in, the TCP connection has nothing to carry.
+    Map link = tcpLink()
+    unschedule("tcpConnect")
+    link.retryPending = false
+    if (link.open || udptcp != "UDP") tcpClose(link)
 }
 
 // invoked from device page or Maker API
@@ -539,6 +615,21 @@ private void connectionCheck(String callerparam = "connectionCheck()") {
         return
     }
 
+    // TCP: the connection to the syslog server should be open, or a
+    // reconnection should be on its way.
+    if (udptcp != "UDP" && ip) {
+        Map link = tcpLink()
+        if (logEnable) {
+            log.debug caller + ": TCP connection " + (link.open ? "open" : "down") +
+                      ", reconnection " + (link.retryPending ? "pending" : "not pending") +
+                      ", " + link.backlog.size() + " line(s) waiting"
+        }
+        if (!link.open && !link.retryPending) {
+            log.warn caller + ": TCP connection to " + ip + ":" + port + " is down; reconnecting"
+            scheduleTcpConnect(link, 1)
+        }
+    }
+
     if (last && quietMillis < staleMillis) {
         if (logEnable) log.debug caller + ": received something " + quietFor + " minute(s) ago; nothing to do"
         return
@@ -551,6 +642,135 @@ private void connectionCheck(String callerparam = "connectionCheck()") {
         log.warn caller + ": nothing received since initialize(); reconnecting"
     }
     connect()
+}
+
+// =================== TCP: one persistent connection ====================
+//
+// With TCP, all lines go to the syslog server over one raw socket that we
+// keep open.  (Previously each line was a HubAction of type LAN_TYPE_RAW,
+// i.e. a connection of its own that then waited for a reply a syslog
+// server never sends: each held on until "Read timed out", and meanwhile
+// the hub queued the rest as "pending hub commands".)
+//
+// sendTcp() and flushTcpBacklog() run on parse()'s path, where nothing
+// may log above debug level (see parse()); they only queue, send, and
+// schedule tcpConnect(), which does the complaining on its own time.
+
+// scheduled by us
+void tcpConnect() {
+    Map link = tcpLink()
+    link.retryPending = false
+
+    if (udptcp == "UDP" || !ip || state.deliberateDisconnect) {
+        if (logEnable) log.debug "tcpConnect(): TCP connection not wanted; not connecting"
+        return
+    }
+
+    // Close whatever we may have had first.  Even if we believe it to be
+    // closed, a re-save of the driver code may have left one open.
+    tcpClose(link)
+    String why = link.remove("lastError")
+
+    try {
+        interfaces.rawSocket.connect(ip, (port ?: 514) as int)
+    } catch (e) {
+        Integer wait = link.retrySecs
+        scheduleTcpConnect(link)
+        link.retrySecs = Math.min(wait * 2, tcpRetryMaxSecs)
+        log.warn "tcpConnect(): cannot connect to " + ip + ":" + port + ": " + e.message +
+                 "; retrying in " + wait + " seconds (" + link.backlog.size() + " line(s) waiting)"
+        return
+    }
+
+    link.open = true
+    link.retrySecs = tcpRetryMinSecs
+    log.info "tcpConnect(): connected to " + ip + ":" + port + (why ? " after: " + why : "")
+
+    Integer dropped = link.dropped ?: 0
+    if (dropped) {
+        link.dropped = 0
+        log.warn "tcpConnect(): " + dropped + " line(s) were discarded while the TCP connection was down" +
+                 " (at most " + tcpBacklogMax + " are kept)"
+    }
+
+    flushTcpBacklog(link)
+}
+
+// called from parse(): queue the line, then send whatever we can
+private void sendTcp(String line) {
+    Map link = tcpLink()
+    link.backlog.offer(line)
+    while (link.backlog.size() > tcpBacklogMax) {
+        if (link.backlog.poll() != null) link.dropped = (link.dropped ?: 0) + 1
+    }
+
+    if (link.open) {
+        flushTcpBacklog(link)
+    } else if (!link.retryPending) {
+        // e.g. after a re-save of the driver code, which forgets the socket
+        scheduleTcpConnect(link)
+    }
+}
+
+// Send the backlog, oldest first, for as long as the connection holds.
+// Only one caller at a time does this, so that lines stay in order and
+// none goes twice; a caller that finds another busy leaves its line for
+// that one, or failing that, for the next line's sender.
+private void flushTcpBacklog(Map link) {
+    if (link.putIfAbsent("flushing", true) != null) return
+    try {
+        String line
+        while (link.open && (line = link.backlog.peek()) != null) {
+            try {
+                // RFC 6587 non-transparent framing: one newline ends the frame.
+                interfaces.rawSocket.sendMessage(line + "\n")
+            } catch (e) {
+                // The line stays at the head of the backlog for next time.
+                link.open = false
+                link.lastError = "send failed: " + e.message
+                if (!link.retryPending) scheduleTcpConnect(link)
+                return
+            }
+            link.backlog.poll()
+        }
+    } finally {
+        link.remove("flushing")
+    }
+}
+
+// Arrange for tcpConnect() to run, after the current back-off unless told
+// otherwise.  At most one such arrangement is pending at a time.
+private void scheduleTcpConnect(Map link, Integer secs = null) {
+    link.retryPending = true
+    runIn(secs ?: link.retrySecs, "tcpConnect")
+}
+
+// Close the TCP connection, noting that it was us so that socketStatus()
+// pays no attention to whatever the hub reports about it.
+private void tcpClose(Map link) {
+    link.open = false
+    link.closedAt = now()
+    try {
+        interfaces.rawSocket.close()
+    } catch (e) {
+        if (logEnable) log.debug "tcpClose(): " + e.message
+    }
+}
+
+// This device's entry in tcpLinks, created on first use.
+private Map tcpLink() {
+    String id = device.id.toString()
+    if (!tcpLinks.containsKey(id)) {
+        tcpLinks.putIfAbsent(id, new java.util.concurrent.ConcurrentHashMap([
+            open:         false,
+            retryPending: false,
+            retrySecs:    tcpRetryMinSecs,
+            closedAt:     0L,
+            dropped:      0,
+            backlog:      new java.util.concurrent.ConcurrentLinkedQueue(),
+        ]))
+    }
+    return tcpLinks[id]
 }
 
 // =================== private utility routines ==========================
