@@ -77,6 +77,9 @@
   - Removed no-longer-needed timezone-related debugging.
   - Compressed the "sending" and "via UDP|TCP" debug log lines into one.
   - Improve loop avoidance: track multiple instances of the driver.
+
+2026-10-09 - Scott A. Johnson (with Claude)
+  - Bugfix: missing ")" closing the "port" preference input.
 */
 
 metadata {
@@ -100,7 +103,7 @@ metadata {
         input("port", "number",
               title: "Syslog IP Port",
               description: "Syslog server port number",
-              defaultValue: 514,
+              defaultValue: 514)
         input("udptcp", "enum",
               title: "Syslog server protocol",
               description: "UDP or TCP?",
