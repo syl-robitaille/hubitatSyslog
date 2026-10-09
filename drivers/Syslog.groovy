@@ -79,6 +79,19 @@
   - Improve loop avoidance: track multiple instances of the driver.
 
 2026-10-09 - Scott A. Johnson (with Claude)
+  - Prefix the forwarded message with the app/device name taken from
+    the logsocket "name" field, as "[<name>] <msg>".  The name is
+    trimmed, CR/LF/TAB become spaces, and "[" / "]" become "(" / ")".
+    No name, no prefix.
+  - Replace every CRLF, LF or CR in the message with the literal text
+    "\n" (like rsyslog's escapeLF), so that one log entry is one
+    syslog message even for multi-line entries such as stack traces.
+  - TCP: end each payload with exactly one newline (RFC 6587
+    non-transparent framing), so a newline-framed receiver ends the
+    frame at once instead of waiting for the connection to close.
+    UDP payloads are unchanged.
+  - With debug logging on, log the logsocket JSON keys once after
+    each initialize(), to confirm the field names.
   - Bugfix: missing ")" closing the "port" preference input.
 */
 
@@ -251,6 +264,7 @@ void initialize() {
 
     // Clear previous state where relevant
     state.remove("deliberateDisconnect")
+    state.remove("jsonKeysLogged")
     state.lastReceived = 0
 
     // Clear previous scheduled jobs where relevant
@@ -385,6 +399,13 @@ void parse(String description) {
         // say, and no "failure" status ever arrives to tell us otherwise.
         state.lastReceived = now()
 
+        // Once per initialize(), show which fields the logsocket JSON
+        // carries.  Debug level only, as rule 2 above requires.
+        if (logEnable && !state.jsonKeysLogged) {
+            state.jsonKeysLogged = true
+            log.debug "parse(): logsocket JSON keys: " + descData.keySet().join(", ")
+        }
+
         if(ip) {
             def priority = facilityMap[logFacility] + priorityMap[logLevel]
 
@@ -399,6 +420,14 @@ void parse(String description) {
             
             // jtp10181
             def message = escapeStringHTMLforMsg(descData.msg)
+
+            // One log entry must be one syslog message: turn line breaks
+            // into the literal text "\n" (as rsyslog's escapeLF does).
+            message = message?.replaceAll(/\r\n|\r|\n/, '\\\\n')
+
+            // Say who logged this, since the header carries only type and id.
+            String name = sanitizeName(descData.name)
+            if (name) message = "[${name}] ${message}"
 
             // made up PROCID or MSGID //TODO find PROCID and MSGID in the API?
             // we fall back to retrieving hostname or IP address here
@@ -416,7 +445,8 @@ void parse(String description) {
             if (udptcp == 'UDP') {
               sendHubCommand(new HubAction(constructedString, Protocol.LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_UDPCLIENT, ignoreResponse:true]))
             } else {
-              sendHubCommand(new HubAction(constructedString, Protocol.RAW_LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_RAW]))
+              // RFC 6587 non-transparent framing: one newline ends the frame.
+              sendHubCommand(new HubAction(constructedString + "\n", Protocol.RAW_LAN, [destinationAddress: "${ip}:${port}", type: HubAction.Type.LAN_TYPE_RAW]))
             }
 
         } else {
@@ -536,6 +566,19 @@ private void setHubDisplayName() { // hub name for outgoing syslog lines
     }
 
     state.displayHostname = name
+}
+
+// App/device name for the "[<name>] " message prefix: no line breaks or
+// tabs, and no square brackets that would confuse where the prefix ends.
+// Returns null when there is no usable name.
+private String sanitizeName(def raw) {
+    if (raw == null) return null
+    String name = raw.toString()
+                     .replaceAll(/[\r\n\t]/, " ")
+                     .replace("[", "(")
+                     .replace("]", ")")
+                     .trim()
+    return name ?: null
 }
 
 // ------------------------------------------------------------------
